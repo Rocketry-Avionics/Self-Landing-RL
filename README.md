@@ -8,8 +8,8 @@ This project simulates and trains a rocket to perform powered self-landing using
 
 ## Video Demo
 
-<video src="resources/video-demo.mp4" controls="controls" width="100%">
-  <a href="resources/video-demo.mp4">Watch Demo Video</a>
+<video src="resources/open-day.mp4" controls="controls" width="100%">
+  <a href="resources/open-day.mp4">Watch Demo Video</a>
 </video>
 
 Credit: Sushan Gopu
