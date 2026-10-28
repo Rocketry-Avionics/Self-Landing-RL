@@ -1,15 +1,11 @@
 // =============================================================================
 // SCRIPT 3: WindAndInput.cs
 // =============================================================================
-// WHAT THIS CODE DOES:
-// This script handles all user keyboard inputs ([Space] Launch, [R] Reset,
-// [S] Toggle PID, [D] Manual Wind Gust) AND generates natural atmospheric
-// wind turbulence during flight.
-//
-// HOW NATURAL WIND GUSTS WORK:
-// Instead of applying an instant, robotic 1-frame snap to the rocket, each wind
-// gust swells smoothly over 0.35 seconds using a sine-wave envelope (Mathf.Sin).
-// This pushes the rocket gradually like a real aerodynamic air current!
+// WHAT IT DOES: 
+// Handles Keyboard Inputs (Launch, Reset, PID toggles) and generates WIND.
+// Features Perlin Noise Turbulence: Adds high-frequency flutter to the wind 
+// forces so it physically judders the rocket instead of pushing robotically smooth.
+// Broadcasts wind telemetry to the HUD for animated warnings.
 // =============================================================================
 
 using UnityEngine;
@@ -19,38 +15,44 @@ using UnityEngine.InputSystem;
 [RequireComponent(typeof(PIDController))]
 public class WindAndInput : MonoBehaviour
 {
-    [Header("Wind Gust Strength Settings (D Key & Auto)")]
-    [Tooltip("Rotational kick strength applied over the duration of a wind gust.")]
-    public float disturbanceKickSpeed = 2.05f;
-    [Tooltip("Lateral sideways drift force applied during a wind gust.")]
-    public float disturbanceSidePush = 0.85f;
-    [Tooltip("How long (in seconds) each wind gust smoothly swells and fades.")]
-    public float gustDuration = 0.35f;
+    [Header("Manual Arrow-Key Wind Strength")]
+    public float windTorqueRate = 12.0f; 
+    public float windPushRate = 5.0f;    
 
     [Header("Automatic Ambient Wind Gusts")]
-    [Tooltip("Automatically triggers natural wind gusts periodically during flight.")]
     public bool enableAutoRandomGusts = true;
-    public float minGustInterval = 2.8f;
-    public float maxGustInterval = 4.5f;
+    public float minGustInterval = 3.5f; 
+    public float maxGustInterval = 6.0f;
+    public float autoGustDuration = 0.4f;
+    public float autoGustStrength = 1.8f;
+
+    [Header("Wind Realism (Perlin Turbulence)")]
+    [Tooltip("How fast the wind shutters and changes strength.")]
+    public float turbulenceSpeed = 12.0f; 
+    [Tooltip("How violently the wind fluctuates (0.4 = +/- 40% jitter).")]
+    public float turbulenceVariance = 0.4f; 
+
+    // Telemetry for the HUD Wind Animation
+    public bool IsWindBlowing { get; private set; } = false;
+    public float CurrentWindDir { get; private set; } = 0f;
 
     private PhyAndControls phy;
     private PIDController pid;
-
-    // State tracking for cumulative vs. alternating gusts
-    private float lastDisturbDir = 1f;
-    private float lastDisturbTime = -10f;
+    
+    // Auto Gust logic
     private float nextAutoGustTime = 0f;
-
-    // Active smooth gust envelope variables
-    private bool isGustActive = false;
-    private float currentGustTimer = 0f;
-    private float activeGustTorqueRate = 0f;
-    private float activeGustForceRate = 0f;
+    private bool isAutoGustActive = false;
+    private float currentAutoGustTimer = 0f;
+    private float activeGustDir = 1f;
+    
+    // Noise offset prevents looping patterns
+    private float noiseOffset;
 
     void Start()
     {
         phy = GetComponent<PhyAndControls>();
         pid = GetComponent<PIDController>();
+        noiseOffset = Random.Range(0f, 1000f);
         ScheduleNextAutoGust();
     }
 
@@ -58,102 +60,72 @@ public class WindAndInput : MonoBehaviour
     {
         if (!Application.isPlaying || Keyboard.current == null) return;
 
-        // SPACE or W: Launch Rocket
-        if ((Keyboard.current.spaceKey.wasPressedThisFrame || Keyboard.current.wKey.wasPressedThisFrame) && !phy.IsLaunched)
-        {
-            phy.LaunchRocket();
-            ScheduleNextAutoGust();
+        // Launch & Reset
+        if ((Keyboard.current.spaceKey.wasPressedThisFrame || Keyboard.current.wKey.wasPressedThisFrame) && !phy.IsLaunched) {
+            phy.LaunchRocket(); ScheduleNextAutoGust();
+        }
+        if (Keyboard.current.rKey.wasPressedThisFrame) {
+            phy.ResetRocket(); isAutoGustActive = false; ScheduleNextAutoGust();
         }
 
-        // R KEY: Reset Rocket to Launchpad
-        if (Keyboard.current.rKey.wasPressedThisFrame)
-        {
-            isGustActive = false;
-            phy.ResetRocket();
-            ScheduleNextAutoGust();
-        }
+        // Avionics Toggles
+        if (Keyboard.current.sKey.wasPressedThisFrame) pid.ToggleMasterPID();
+        if (Keyboard.current.digit1Key.wasPressedThisFrame) pid.useP = !pid.useP;
+        if (Keyboard.current.digit2Key.wasPressedThisFrame) pid.useI = !pid.useI;
+        if (Keyboard.current.digit3Key.wasPressedThisFrame) pid.useD = !pid.useD;
 
-        // S KEY: Toggle PID Stabilization Loop
-        if (Keyboard.current.sKey.wasPressedThisFrame)
-        {
-            pid.TogglePID();
-        }
-
-        // D KEY: Manual On-Command Wind Disturbance
-        if (Keyboard.current.dKey.wasPressedThisFrame && phy.IsLaunched && !phy.IsCrashed)
-        {
-            TriggerWindGust(isManualKey: true);
-            ScheduleNextAutoGust();
-        }
-
-        // Automatic periodic random wind gusts while flying
-        if (enableAutoRandomGusts && phy.IsLaunched && !phy.IsStalled && !phy.IsCrashed && phy.currentBurnTime > 0.8f)
-        {
-            if (Time.time >= nextAutoGustTime)
-            {
-                TriggerWindGust(isManualKey: false);
-                ScheduleNextAutoGust();
-            }
+        // Auto-Gust Trigger
+        if (enableAutoRandomGusts && phy.IsLaunched && !phy.IsStalled && !phy.IsCrashed && phy.currentBurnTime > 0.8f) {
+            if (Time.time >= nextAutoGustTime && !isAutoGustActive) { TriggerAutoGust(); ScheduleNextAutoGust(); }
         }
     }
 
-    // Applies the active wind gust smoothly across physics frames using a sine bell curve
+    void ScheduleNextAutoGust() { nextAutoGustTime = Time.time + Random.Range(minGustInterval, maxGustInterval); }
+
+    void TriggerAutoGust() { activeGustDir = Random.value > 0.5f ? 1f : -1f; currentAutoGustTimer = 0f; isAutoGustActive = true; }
+
     void FixedUpdate()
     {
-        if (!Application.isPlaying || !isGustActive || !phy.IsLaunched || phy.IsCrashed) return;
+        IsWindBlowing = false;
+        CurrentWindDir = 0f;
 
-        currentGustTimer += Time.fixedDeltaTime;
-        if (currentGustTimer >= gustDuration)
+        if (!Application.isPlaying || !phy.IsLaunched || phy.IsCrashed) return;
+
+        // Generate Perlin Noise Jitter multiplier (fluctuates between 0.6x and 1.4x)
+        float rawNoise = Mathf.PerlinNoise((Time.time + noiseOffset) * turbulenceSpeed, 0f);
+        float jitterMultiplier = 1f + ((rawNoise - 0.5f) * 2f * turbulenceVariance);
+
+        // 1. MANUAL ARROW KEY WIND (With Turbulence)
+        float windInput = 0f;
+        if (Keyboard.current.leftArrowKey.isPressed) windInput = -1f;
+        if (Keyboard.current.rightArrowKey.isPressed) windInput = 1f;
+
+        if (windInput != 0f)
         {
-            isGustActive = false;
-            return;
+            IsWindBlowing = true;
+            CurrentWindDir = windInput;
+            phy.Rb.angularVelocity += new Vector3(0f, 0f, windInput * windTorqueRate * jitterMultiplier * Time.fixedDeltaTime);
+            phy.Rb.AddForce(new Vector3(-windInput * windPushRate * jitterMultiplier, 0f, 0f) * Time.fixedDeltaTime, ForceMode.VelocityChange);
         }
 
-        // Sine wave bell curve (0 -> 1 -> 0) so the wind swells and fades naturally
-        float progress = currentGustTimer / gustDuration;
-        float smoothEnvelope = Mathf.Sin(progress * Mathf.PI) * (Mathf.PI / 2f);
-
-        float stepFactor = (Time.fixedDeltaTime / gustDuration) * smoothEnvelope;
-        phy.Rb.angularVelocity += new Vector3(0f, 0f, activeGustTorqueRate * stepFactor);
-        phy.Rb.AddForce(new Vector3(activeGustForceRate * stepFactor, 0f, 0f), ForceMode.VelocityChange);
-    }
-
-    void ScheduleNextAutoGust()
-    {
-        nextAutoGustTime = Time.time + Random.Range(minGustInterval, maxGustInterval);
-    }
-
-    /// <summary>
-    /// Initiates a smooth wind gust. Rapid manual presses (< 2.2s apart) stack in the
-    /// same direction so 3 rapid presses of [D] can overwhelm the PID and demonstrate stall.
-    /// </summary>
-    public void TriggerWindGust(bool isManualKey)
-    {
-        float timeSinceLastGust = Time.time - lastDisturbTime;
-
-        if (isManualKey)
+        // 2. SMOOTH AUTO GUSTS (With Turbulence)
+        if (isAutoGustActive)
         {
-            // Single D press after waiting picks a random side; rapid D presses stack on the same side!
-            if (timeSinceLastGust > 2.2f)
+            currentAutoGustTimer += Time.fixedDeltaTime;
+            if (currentAutoGustTimer >= autoGustDuration) { isAutoGustActive = false; }
+            else
             {
-                lastDisturbDir = Random.value > 0.5f ? 1f : -1f;
+                IsWindBlowing = true;
+                CurrentWindDir = activeGustDir;
+                
+                // Sine wave envelope
+                float progress = currentAutoGustTimer / autoGustDuration;
+                float smoothEnvelope = Mathf.Sin(progress * Mathf.PI) * (Mathf.PI / 2f);
+                float stepFactor = (Time.fixedDeltaTime / autoGustDuration) * smoothEnvelope * jitterMultiplier;
+
+                phy.Rb.angularVelocity += new Vector3(0f, 0f, activeGustDir * autoGustStrength * stepFactor);
+                phy.Rb.AddForce(new Vector3(-activeGustDir * (autoGustStrength * 0.4f) * stepFactor, 0f, 0f), ForceMode.VelocityChange);
             }
         }
-        else
-        {
-            // Ambient auto-gusts pick a random direction
-            lastDisturbDir = Random.value > 0.5f ? 1f : -1f;
-        }
-
-        lastDisturbTime = Time.time;
-        float intensity = isManualKey ? Random.Range(0.95f, 1.15f) : Random.Range(0.65f, 0.90f);
-
-        // If a gust is already mid-blow, add to it so rapid D presses compound smoothly!
-        float remainingFraction = isGustActive ? (1f - (currentGustTimer / gustDuration)) : 0f;
-        activeGustTorqueRate = (activeGustTorqueRate * remainingFraction) + (lastDisturbDir * disturbanceKickSpeed * intensity);
-        activeGustForceRate = (activeGustForceRate * remainingFraction) + (-lastDisturbDir * disturbanceSidePush * intensity);
-
-        currentGustTimer = 0f;
-        isGustActive = true;
     }
 }
